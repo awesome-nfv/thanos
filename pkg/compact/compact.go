@@ -4,11 +4,12 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
 	"sort"
 	"sync"
 	"time"
+
+	"io/ioutil"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -441,7 +442,7 @@ func (cg *Group) Resolution() int64 {
 // Compact plans and runs a single compaction against the group. The compacted result
 // is uploaded into the bucket the blocks were retrieved from.
 func (cg *Group) Compact(ctx context.Context, dir string, comp tsdb.Compactor) (ulid.ULID, error) {
-	subDir := path.Join(dir, cg.Key())
+	subDir := filepath.Join(dir, cg.Key())
 
 	if err := os.RemoveAll(subDir); err != nil {
 		return ulid.ULID{}, errors.Wrap(err, "clean compaction group dir")
@@ -450,13 +451,34 @@ func (cg *Group) Compact(ctx context.Context, dir string, comp tsdb.Compactor) (
 		return ulid.ULID{}, errors.Wrap(err, "create compaction group dir")
 	}
 
-	id, err := cg.compact(ctx, subDir, comp)
+	compID, err := cg.compact(ctx, subDir, comp)
 	if err != nil {
 		cg.compactionFailures.Inc()
 	}
 	cg.compactions.Inc()
 
-	return id, err
+	return compID, err
+}
+
+// Issue347Error is a type wrapper for errors that should invoke repair process for broken block.
+type Issue347Error struct {
+	err error
+
+	id ulid.ULID
+}
+
+func issue347Error(err error, brokenBlock ulid.ULID) Issue347Error {
+	return Issue347Error{err: err, id: brokenBlock}
+}
+
+func (e Issue347Error) Error() string {
+	return e.err.Error()
+}
+
+// Issue347Error returns true if the base error is a Issue347Error.
+func IsIssue347Error(err error) bool {
+	_, ok := errors.Cause(err).(Issue347Error)
+	return ok
 }
 
 // HaltError is a type wrapper for errors that should halt any further progress on compactions.
@@ -532,6 +554,60 @@ func (cg *Group) areBlocksOverlapping(include *block.Meta, excludeDirs ...string
 	return nil
 }
 
+// RepairIssue347 repairs the https://github.com/prometheus/tsdb/issues/347 issue when having issue347Error.
+func RepairIssue347(ctx context.Context, logger log.Logger, bkt objstore.Bucket, issue347Err error) error {
+	ie, ok := errors.Cause(issue347Err).(Issue347Error)
+	if !ok {
+		return errors.Errorf("Given error is not an issue347 error: %v", issue347Err)
+	}
+
+	level.Info(logger).Log("msg", "Repairing block broken by https://github.com/prometheus/tsdb/issues/347", "id", ie.id, "err", issue347Err)
+
+	tmpdir, err := ioutil.TempDir("", fmt.Sprintf("repair-issue-347-id-%s-", ie.id))
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpdir)
+
+	bdir := filepath.Join(tmpdir, ie.id.String())
+	if err := block.Download(ctx, bkt, ie.id, bdir); err != nil {
+		return retry(errors.Wrapf(err, "download block %s", ie.id))
+	}
+
+	meta, err := block.ReadMetaFile(bdir)
+	if err != nil {
+		return errors.Wrapf(err, "read meta from %s", bdir)
+	}
+
+	resid, err := block.Repair(tmpdir, ie.id, block.CompactorRepairSource, block.IgnoreIssue347OutsideChunk)
+	if err != nil {
+		return errors.Wrapf(err, "repair failed for block %s", ie.id)
+	}
+
+	// Verify repaired id before uploading it.
+	if err := block.VerifyIndex(filepath.Join(tmpdir, resid.String(), block.IndexFilename), meta.MinTime, meta.MaxTime); err != nil {
+		return errors.Wrapf(err, "repaired block is invalid %s", resid)
+	}
+
+	level.Info(logger).Log("msg", "uploading repaired block", "newID", resid)
+	if err = block.Upload(ctx, bkt, filepath.Join(tmpdir, resid.String())); err != nil {
+		return retry(errors.Wrapf(err, "upload of %s failed", resid))
+	}
+
+	level.Info(logger).Log("msg", "deleting broken block", "id", ie.id)
+
+	// Spawn a new context so we always delete a block in full on shutdown.
+	delCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// TODO(bplotka): Issue with this will introduce overlap that will halt compactor. Automate that (fix duplicate overlaps caused by this).
+	if err := block.Delete(delCtx, bkt, ie.id); err != nil {
+		return errors.Wrapf(err, "deleting old block %s failed. You need to delete this block manually", ie.id)
+	}
+
+	return nil
+}
+
 func (cg *Group) compact(ctx context.Context, dir string, comp tsdb.Compactor) (compID ulid.ULID, err error) {
 	cg.mtx.Lock()
 	defer cg.mtx.Unlock()
@@ -592,13 +668,26 @@ func (cg *Group) compact(ctx context.Context, dir string, comp tsdb.Compactor) (
 			return compID, errors.Wrapf(err, "plan dir %s", pdir)
 		}
 
+		if meta.ULID.Compare(id) != 0 {
+			return compID, errors.Errorf("mismatch between meta %s and dir %s", meta.ULID, id)
+		}
+
 		if err := block.Download(ctx, cg.bkt, id, pdir); err != nil {
 			return compID, retry(errors.Wrapf(err, "download block %s", id))
 		}
 
 		// Ensure all input blocks are valid.
-		if err := block.VerifyIndex(filepath.Join(pdir, block.IndexFilename), meta.MinTime, meta.MaxTime); err != nil {
-			return compID, halt(errors.Wrapf(err, "invalid plan block %s", pdir))
+		stats, err := block.GatherIndexIssueStats(filepath.Join(pdir, block.IndexFilename), meta.MinTime, meta.MaxTime)
+		if err != nil {
+			return compID, errors.Wrapf(err, "gather index issues for block %s", pdir)
+		}
+
+		if err := stats.CriticalErr(); err != nil {
+			return compID, halt(errors.Wrapf(err, "invalid plan id %s", pdir))
+		}
+
+		if err := stats.Issue347OutsideChunksErr(); err != nil {
+			return compID, issue347Error(errors.Wrapf(err, "invalid reparable block %s", pdir), meta.ULID)
 		}
 	}
 	level.Debug(cg.logger).Log("msg", "downloaded and verified blocks",
@@ -615,9 +704,17 @@ func (cg *Group) compact(ctx context.Context, dir string, comp tsdb.Compactor) (
 
 	bdir := filepath.Join(dir, compID.String())
 
-	newMeta, err := block.Finalize(bdir, cg.labels.Map(), cg.resolution, nil)
+	newMeta, err := block.InjectThanosMeta(bdir, block.ThanosMeta{
+		Labels:     cg.labels.Map(),
+		Downsample: block.ThanosDownsampleMeta{Resolution: cg.resolution},
+		Source:     block.CompactorSource,
+	}, nil)
 	if err != nil {
 		return compID, errors.Wrapf(err, "failed to finalize the block %s", bdir)
+	}
+
+	if err = os.Remove(filepath.Join(bdir, "tombstones")); err != nil {
+		return compID, errors.Wrap(err, "remove tombstones")
 	}
 
 	// Ensure the output block is valid.
